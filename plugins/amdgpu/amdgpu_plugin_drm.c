@@ -43,12 +43,15 @@ int get_gem_handle(amdgpu_device_handle h_dev, int dmabuf_fd)
 {
 	uint32_t handle;
 	int fd = amdgpu_device_get_fd(h_dev);
+	int ret;
 
 	if (dmabuf_fd == -1) {
 		return -1;
 	}
 
-	drmPrimeFDToHandle(fd, dmabuf_fd, &handle);
+	ret = drmPrimeFDToHandle(fd, dmabuf_fd, &handle);
+	if (ret)
+		return ret;
 
 	return handle;
 }

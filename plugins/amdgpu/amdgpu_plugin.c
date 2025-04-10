@@ -37,6 +37,7 @@
 #include "sockets.h"
 
 #include "common/list.h"
+#include "amdgpu_plugin_dmabuf.h"
 #include "amdgpu_plugin_drm.h"
 #include "amdgpu_plugin_util.h"
 #include "amdgpu_plugin_topology.h"
@@ -45,7 +46,7 @@
 #include "img-streamer.h"
 #include "image.h"
 #include "cr_options.h"
-
+#include "util.h"
 struct vma_metadata {
 	struct list_head list;
 	uint64_t old_pgoff;
@@ -1381,7 +1382,17 @@ int amdgpu_plugin_dump_file(int fd, int id)
 		return -1;
 	}
 
-	/* Check whether this plugin was called for kfd or render nodes */
+	/* Check whether this plugin was called for kfd, dmabuf or render nodes */
+	ret = get_dmabuf_info(fd, &st);
+	if (ret < 0) {
+		pr_perror("Failed to get dmabuf info");
+		return -1;
+	} else if (ret == 0) {
+		pr_info("Dumping dmabuf fd = %d\n", fd);
+		ret = amdgpu_plugin_dmabuf_dump(fd, id, &st);
+		return ret;
+	}
+
 	if (major(st.st_rdev) != major(st_kfd.st_rdev) || minor(st.st_rdev) != 0) {
 
 		/* This is RenderD dumper plugin, for now just save renderD
@@ -1393,9 +1404,6 @@ int amdgpu_plugin_dump_file(int fd, int id)
 			return ret;
 
 		ret = record_dumped_fd(fd, true);
-		if (ret)
-			return ret;
-
 		/* Need to return success here so that criu can call plugins for renderD nodes */
 		return ret;
 	}
@@ -1519,7 +1527,6 @@ static int restore_devices(struct kfd_ioctl_criu_args *args, CriuKfd *e)
 	int ret = 0, bucket_index = 0;
 
 	pr_debug("Restoring %d devices\n", e->num_of_gpus);
-
 	args->num_devices = e->num_of_gpus;
 	device_buckets = xzalloc(sizeof(*device_buckets) * args->num_devices);
 	if (!device_buckets)
@@ -1808,12 +1815,17 @@ int amdgpu_plugin_restore_file(int id, bool *retry_needed)
 		 * first as we assume restore_maps is already filled. Need to fix this later.
 		 */
 		snprintf(img_path, sizeof(img_path), IMG_DRM_FILE, id);
-		pr_info("Restoring RenderD %s\n", img_path);
 
 		img_fp = open_img_file(img_path, false, &img_size);
-		if (!img_fp)
-			return -EINVAL;
-
+		if (!img_fp) {
+			ret = amdgpu_plugin_dmabuf_restore(id);
+			if (ret == -1) {
+				*retry_needed = true;
+				return 0;
+			}
+			return ret;
+		}
+		pr_info("Restoring RenderD %s\n", img_path);
 		pr_debug("RenderD Image file size:%ld\n", img_size);
 		buf = xmalloc(img_size);
 		if (!buf) {
