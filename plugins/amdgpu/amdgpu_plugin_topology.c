@@ -59,11 +59,21 @@ int open_drm_render_device(int minor)
 	snprintf(path, sizeof(path), "/dev/dri/renderD%d", minor);
 	fd = open(path, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
+		DIR *dir = opendir("/dev/dri/");
+		struct dirent *ent;
+
 		if (errno != ENOENT && errno != EPERM) {
 			pr_err("Failed to open %s: %s\n", path, strerror(errno));
 			if (errno == EACCES)
 				pr_err("Check user is in \"video\" group\n");
 		}
+
+		if (dir) {
+			while ((ent = readdir(dir)) != NULL)
+				pr_info("/dev/dri contains file %s", ent->d_name);
+			closedir(dir);
+		}
+
 		return -EBADFD;
 	}
 
