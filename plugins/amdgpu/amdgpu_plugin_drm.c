@@ -95,6 +95,30 @@ static int allocate_bo_entries(CriuRenderNode *e, int num_bos)
 	return 0;
 }
 
+static int allocate_queue_entries(CriuRenderNode *e, int num_queues)
+{
+	e->queue_entries = xmalloc(sizeof(DrmQueueEntry *) * num_queues);
+	if (!e->queue_entries) {
+		pr_err("Failed to allocate queue_entries\n");
+		return -ENOMEM;
+	}
+
+	for (int i = 0; i < num_queues; i++) {
+		DrmQueueEntry *entry = xzalloc(sizeof(*entry));
+
+		if (!entry) {
+			pr_err("Failed to allocate DrmQueueEntry\n");
+			return -ENOMEM;
+		}
+
+		drm_queue_entry__init(entry);
+
+		e->queue_entries[i] = entry;
+		e->n_queue_entries++;
+	}
+	return 0;
+}
+
 static int allocate_vm_entries(DrmBoEntry *e, int num_vms)
 {
 	e->vm_entries = xmalloc(sizeof(DrmVmEntry *) * num_vms);
@@ -124,6 +148,10 @@ static void free_e(CriuRenderNode *e)
 	for (int i = 0; i < e->n_bo_entries; i++) {
 		if (e->bo_entries[i])
 			xfree(e->bo_entries[i]);
+	}
+	for (int i = 0; i < e->n_queue_entries; i++) {
+		if (e->queue_entries[i])
+			xfree(e->queue_entries[i]);
 	}
 
 	xfree(e);
@@ -250,7 +278,10 @@ int amdgpu_plugin_drm_dump_file(int fd, int id, struct stat *drm)
 	struct tp_node *tp_node;
 	struct drm_amdgpu_gem_list_handles list_handles_args = { 0 };
 	struct drm_amdgpu_gem_list_handles_entry *list_handles_entries = NULL;
-	int num_bos;
+	struct drm_amdgpu_userq_list_entry *userq_entries = NULL;
+	union drm_amdgpu_userq userq = {0};
+	unsigned char **mqds;
+	int num_bos, num_queues, i;
 
 	rd = xmalloc(sizeof(*rd));
 	if (!rd) {
@@ -306,7 +337,7 @@ int amdgpu_plugin_drm_dump_file(int fd, int id, struct stat *drm)
 	if (ret)
 		goto exit;
 
-	for (int i = 0; i < num_bos; i++) {
+	for (i = 0; i < num_bos; i++) {
 		int num_vm_entries = 8;
 		struct drm_amdgpu_gem_vm_entry *vm_info_entries = NULL;
 		DrmBoEntry *boinfo = rd->bo_entries[i];
@@ -447,12 +478,100 @@ int amdgpu_plugin_drm_dump_file(int fd, int id, struct stat *drm)
 		xfree(vm_info_entries);
 	}
 
-	for (int i = 0; i < num_bos; i++) {
+	for (i = 0; i < num_bos; i++) {
 		DrmBoEntry *boinfo = rd->bo_entries[i];
 
 		ret = record_shared_bo(boinfo->handle, boinfo->is_import);
 		if (ret)
 			goto exit;
+	}
+
+	/* Get number of queues */
+	userq.list_in_out.op = AMDGPU_USERQ_OP_LIST;
+	ret = drmIoctl(fd, DRM_IOCTL_AMDGPU_USERQ, &userq);
+	/* failure here indicates kernel lacks this ioctl option */
+	if (!ret && userq.list_in_out.num_entries > 0) {
+		num_queues = userq.list_in_out.num_entries;
+		userq_entries = xzalloc(sizeof(struct drm_amdgpu_userq_list_entry) * num_queues);
+		if (!userq_entries) {
+			ret = -ENOMEM;
+			goto exit;
+		}
+		mqds = xzalloc(sizeof(void *) * num_queues);
+		if (!mqds) {
+			ret = -ENOMEM;
+			goto exit;
+		}
+
+		/* Get size of mqds */
+		memset(&userq, 0, sizeof(userq));
+		userq.list_in_out.op = AMDGPU_USERQ_OP_LIST;
+		userq.list_in_out.num_entries = num_queues;
+		userq.list_in_out.entries = (uint64_t)userq_entries;
+
+		ret = drmIoctl(fd, DRM_IOCTL_AMDGPU_USERQ, &userq);
+		if (ret)
+			goto exit;
+
+		for (i = 0; i < num_queues; i++) {
+			struct drm_amdgpu_userq_list_entry *userq_entry = &userq_entries[i];
+			if (userq_entry->ip_type == AMDGPU_HW_IP_COMPUTE &&
+				userq_entry->mqd_size == sizeof(struct drm_amdgpu_userq_mqd_compute_gfx11)) {
+				mqds[i] = xzalloc(sizeof(struct drm_amdgpu_userq_mqd_compute_gfx11));
+				if (!mqds[i]) {
+					ret = -ENOMEM;
+					goto exit;
+				}
+				userq_entry->mqd_data = (uint64_t)mqds[i];
+			} else if (userq_entry->ip_type == AMDGPU_HW_IP_GFX &&
+				userq_entry->mqd_size == sizeof(struct drm_amdgpu_userq_mqd_gfx11)) {
+				mqds[i] = xzalloc(sizeof(struct drm_amdgpu_userq_mqd_gfx11));
+				if (!mqds[i]) {
+					ret = -ENOMEM;
+					goto exit;
+				}
+				userq_entry->mqd_data = (uint64_t)mqds[i];
+			} else if (userq_entry->ip_type == AMDGPU_HW_IP_DMA &&
+				userq_entry->mqd_size == sizeof(struct drm_amdgpu_userq_mqd_sdma_gfx11)) {
+				mqds[i] = xzalloc(sizeof(struct drm_amdgpu_userq_mqd_sdma_gfx11));
+				if (!mqds[i]) {
+					ret = -ENOMEM;
+					goto exit;
+				}
+				userq_entry->mqd_data = (uint64_t)mqds[i];
+			} else {
+				ret = -EINVAL;
+				goto exit;
+			}
+		}
+
+		ret = drmIoctl(fd, DRM_IOCTL_AMDGPU_USERQ, &userq);
+		if (ret)
+			goto exit;
+
+		rd->num_of_queues = num_queues;
+		ret = allocate_queue_entries(rd, num_queues);
+		if (ret)
+			goto exit;
+
+		for (i = 0; i < num_queues; i++) {
+			DrmQueueEntry *queue_info = rd->queue_entries[i];
+			struct drm_amdgpu_userq_list_entry *userq_entry = &userq_entries[i];
+
+			queue_info->queue_id = userq_entry->queue_id;
+			queue_info->ip_type = userq_entry->ip_type;
+			queue_info->doorbell_handle = userq_entry->doorbell_handle;
+			queue_info->doorbell_offset = userq_entry->doorbell_offset;
+			queue_info->flags = userq_entry->flags;
+			queue_info->queue_va = userq_entry->queue_va;
+			queue_info->queue_size = userq_entry->queue_size;
+			queue_info->rptr_va = userq_entry->rptr_va;
+			queue_info->wptr_va = userq_entry->wptr_va;
+
+			queue_info->mqd.len = userq_entry->mqd_size;
+			if (mqds[i])
+				queue_info->mqd.data = mqds[i];
+		}
 	}
 
 	tp_node = sys_get_node_by_render_minor(&src_topology, minor);
@@ -481,6 +600,11 @@ int amdgpu_plugin_drm_dump_file(int fd, int id, struct stat *drm)
 	xfree(buf);
 exit:
 	xfree(list_handles_entries);
+	xfree(userq_entries);
+	for (i = 0; i < num_queues; i++)
+		xfree(mqds[i]);
+	xfree(mqds);
+
 	if (rd)
 		free_e(rd);
 	return ret;
@@ -597,6 +721,53 @@ int amdgpu_plugin_drm_restore_file(int fd, CriuRenderNode *rd)
 		ret = save_vma_updates(boinfo->offset, boinfo->addr,
 				       mmap_args.out.addr_ptr, fd);
 		if (ret < 0)
+			goto exit;
+	}
+
+	for (int i = 0; i < rd->num_of_queues; i++) {
+		DrmQueueEntry *queue_info = rd->queue_entries[i];
+		union drm_amdgpu_userq userq = {0};
+		uint32_t given_queue_id;
+
+		userq.in.op = AMDGPU_USERQ_OP_CREATE;
+		userq.in.ip_type = queue_info->ip_type;
+		userq.in.doorbell_handle = queue_info->doorbell_handle;
+		userq.in.doorbell_offset = queue_info->doorbell_offset;
+		userq.in.flags = queue_info->flags;
+		userq.in.queue_va = queue_info->queue_va;
+		userq.in.queue_size = queue_info->queue_size;
+		userq.in.rptr_va = queue_info->rptr_va;
+		userq.in.wptr_va = queue_info->wptr_va;
+
+		if (queue_info->ip_type == AMDGPU_HW_IP_COMPUTE &&
+			queue_info->mqd.len == sizeof(struct drm_amdgpu_userq_mqd_compute_gfx11)) {
+
+			userq.in.mqd_size = queue_info->mqd.len;
+			userq.in.mqd = (uint64_t)queue_info->mqd.data;
+		} else if (queue_info->ip_type == AMDGPU_HW_IP_GFX &&
+			queue_info->mqd.len == sizeof(struct drm_amdgpu_userq_mqd_gfx11)) {
+
+			userq.in.mqd_size = queue_info->mqd.len;
+			userq.in.mqd = (uint64_t)queue_info->mqd.data;
+		} else if (queue_info->ip_type == AMDGPU_HW_IP_DMA &&
+			queue_info->mqd.len == sizeof(struct drm_amdgpu_userq_mqd_sdma_gfx11)) {
+
+			userq.in.mqd_size = queue_info->mqd.len;
+			userq.in.mqd = (uint64_t)queue_info->mqd.data;
+		}
+
+		ret = drmIoctl(fd, DRM_IOCTL_AMDGPU_USERQ, &userq);
+		if (ret)
+			goto exit;
+
+		/** Change queue id to expected value */
+		given_queue_id = userq.out.queue_id;
+		memset(&userq, 0, sizeof(userq));
+		userq.change_in.op = AMDGPU_USERQ_OP_CHANGE_ID;
+		userq.change_in.queue_id = given_queue_id;
+		userq.change_in.new_queue_id = queue_info->queue_id;
+		ret = drmIoctl(fd, DRM_IOCTL_AMDGPU_USERQ, &userq);
+		if (ret)
 			goto exit;
 	}
 

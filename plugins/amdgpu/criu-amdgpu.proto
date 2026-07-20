@@ -82,12 +82,27 @@ message drm_vm_entry {
 	required uint64 flags = 4;
 }
 
+message drm_queue_entry {
+	required uint32 queue_id = 1;
+	required uint32 ip_type = 2;
+	required uint32 doorbell_handle = 3;
+	required uint32 doorbell_offset = 4;
+	required uint32 flags = 5;
+	required uint64 queue_va = 6;
+	required uint64 queue_size = 7;
+	required uint64 rptr_va = 8;
+	required uint64 wptr_va = 9;
+	required bytes mqd = 10;
+}
+
 message criu_render_node {
 	required uint32 gpu_id = 1;
 	required uint32 id = 2;
 	required uint32 drm_render_minor = 3;
 	required uint64 num_of_bos = 4;
 	repeated drm_bo_entry bo_entries = 5;
+	required uint64 num_of_queues = 6;
+	repeated drm_queue_entry queue_entries = 7;
 }
 
 message criu_dmabuf_node {
